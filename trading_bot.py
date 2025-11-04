@@ -3,7 +3,7 @@ import os
 import time
 import logging
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 import yfinance as yf
 import pandas as pd
@@ -22,7 +22,6 @@ def sanitize_ticker(raw_ticker: str, default: str = "AAPL") -> str:
     if raw_ticker is None:
         logger.error("TICKER is None (not set). Falling back to default: %s", default)
         return default
-
     logger.info("Raw TICKER repr: %r (len=%d)", raw_ticker, len(raw_ticker))
     t = raw_ticker.strip()
     if (t.startswith('"') and t.endswith('"')) or (t.startswith("'") and t.endswith("'")):
@@ -49,7 +48,6 @@ def sanitize_timeframe(raw_tf: str, default: str = "1d") -> str:
     if tf == "":
         logger.warning("TIMEFRAME is empty after cleaning; using default '%s'.", default)
         return default
-    # Accept typical patterns like '1d', '1h', '5m', '60m'
     if not re.fullmatch(r"\d+[mhdwM]", tf):
         logger.warning("TIMEFRAME '%s' looks unusual; falling back to default '%s'.", tf, default)
         return default
@@ -68,9 +66,7 @@ TIMEFRAME = sanitize_timeframe(os.environ.get("TIMEFRAME", "1d"))
 DATA_LOOKBACK_DAYS = int(os.environ.get("DATA_LOOKBACK_DAYS", "90"))
 
 if not API_KEY or not API_SECRET:
-    logger.error("ALPACA_API_KEY and ALPACA_SECRET_KEY must be set as environment variables.")
-    # Do not raise here if you prefer graceful no-op; we'll stop later if missing.
-    # raise SystemExit("Missing Alpaca API credentials")
+    logger.warning("ALPACA_API_KEY and/or ALPACA_SECRET_KEY not set. Alpaca fallback/trading will be unavailable if missing.")
 
 # Alpaca client (constructed only if keys provided)
 api = None
@@ -91,7 +87,6 @@ def _alpaca_bars_to_df(bars):
     rows = []
     for b in bars:
         try:
-            # support object-like (attributes) and dict-like
             t = getattr(b, "t", None) or (b.get("t") if isinstance(b, dict) else None)
             o = getattr(b, "o", None) or (b.get("o") if isinstance(b, dict) else None)
             h = getattr(b, "h", None) or (b.get("h") if isinstance(b, dict) else None)
@@ -125,7 +120,7 @@ _ALPACA_INTERVAL_MAP = {
     "1w": "1Week",
 }
 
-# --- Robust fetch_data with yfinance + Alpaca fallback (limit-based) ---
+# --- Robust fetch_data with yfinance + Alpaca fallback (limit-based & retry if insufficient) ---
 def fetch_data(ticker: str, lookback_days: int, interval: str = "1d") -> pd.DataFrame:
     ticker = (ticker or "").strip()
     if ticker == "":
@@ -136,7 +131,7 @@ def fetch_data(ticker: str, lookback_days: int, interval: str = "1d") -> pd.Data
     period = f"{max(30, lookback_days)}d"
     logger.info("fetch_data: yfinance.download(ticker=%r, period=%r, interval=%r)", ticker, period, interval)
 
-    # Try yfinance
+    # Try yfinance first
     max_attempts = 3
     for attempt in range(1, max_attempts + 1):
         try:
@@ -174,7 +169,7 @@ def fetch_data(ticker: str, lookback_days: int, interval: str = "1d") -> pd.Data
         if alp_tf is None:
             alp_tf = _ALPACA_INTERVAL_MAP.get(interval.lower(), "1Day")
 
-        # Determine limit (number of bars) conservatively
+        # Determine a conservative initial 'limit' number of bars
         if interval.endswith("d") or interval.lower() in ("1d", "1w"):
             limit = max(lookback_days, 30)
         else:
@@ -194,30 +189,66 @@ def fetch_data(ticker: str, lookback_days: int, interval: str = "1d") -> pd.Data
 
         logger.info("Alpaca fallback: get_bars(symbol=%r, timeframe=%r, limit=%d)", ticker, alp_tf, limit)
 
-        # Try modern get_bars signature
+        # First attempt
         try:
             bars = api.get_bars(ticker, alp_tf, limit=limit)
             df_bars = _alpaca_bars_to_df(bars)
             if not df_bars.empty:
                 logger.info("Alpaca get_bars succeeded for %s (%d rows).", ticker, len(df_bars))
-                return df_bars
-            logger.warning("Alpaca get_bars returned empty for %s.", ticker)
+            else:
+                logger.warning("Alpaca get_bars returned empty for %s.", ticker)
         except Exception as e:
             logger.debug("Alpaca get_bars exception: %s", e)
+            df_bars = pd.DataFrame()
 
-        # Try older get_barset as fallback
+        # If data exists, ensure there are enough rows
+        if not df_bars.empty:
+            required_bars = LONG_WINDOW + 5  # cushion for indicators
+            if df_bars.shape[0] < required_bars:
+                logger.warning(
+                    "Alpaca returned only %d rows but %d required. Attempting to fetch more bars.",
+                    df_bars.shape[0], required_bars
+                )
+                extra_limit = min(max(required_bars * 2, limit * 2), 5000)
+                logger.info("Retrying Alpaca get_bars with increased limit=%d", extra_limit)
+                try:
+                    bars_retry = api.get_bars(ticker, alp_tf, limit=extra_limit)
+                    df_bars_retry = _alpaca_bars_to_df(bars_retry)
+                    if not df_bars_retry.empty and df_bars_retry.shape[0] >= required_bars:
+                        logger.info("Retry succeeded: got %d rows from Alpaca.", df_bars_retry.shape[0])
+                        return df_bars_retry
+                    else:
+                        logger.warning("Retry returned %d rows (still insufficient).", df_bars_retry.shape[0] if not df_bars_retry.empty else 0)
+                        logger.error("Insufficient historical bars after retry for %s. Aborting fetch.", ticker)
+                        return pd.DataFrame()
+                except Exception as e:
+                    logger.exception("Alpaca retry failed: %s", e)
+                    return pd.DataFrame()
+            else:
+                # Enough bars
+                return df_bars
+
+        # If get_bars failed or returned empty, try older get_barset as a last attempt
         try:
+            logger.info("Attempting older api.get_barset(...) as a last resort (limit=%d)", limit)
             barset = api.get_barset(ticker, interval, limit=limit)
             bars = barset.get(ticker) if isinstance(barset, dict) else getattr(barset, ticker, barset)
-            df_bars = _alpaca_bars_to_df(bars)
-            if not df_bars.empty:
-                logger.info("Alpaca get_barset succeeded for %s (%d rows).", ticker, len(df_bars))
-                return df_bars
-            logger.warning("Alpaca get_barset returned empty for %s.", ticker)
+            df_barset = _alpaca_bars_to_df(bars)
+            if not df_barset.empty:
+                logger.info("Alpaca get_barset succeeded for %s (%d rows).", ticker, len(df_barset))
+                # check sufficiency
+                required_bars = LONG_WINDOW + 5
+                if df_barset.shape[0] < required_bars:
+                    logger.error("Alpaca get_barset returned only %d rows but %d required. Aborting fetch.",
+                                 df_barset.shape[0], required_bars)
+                    return pd.DataFrame()
+                return df_barset
+            else:
+                logger.warning("Alpaca get_barset returned empty for %s.", ticker)
         except Exception as e:
             logger.debug("Alpaca get_barset failed: %s", e)
 
-        logger.error("Alpaca fallback did not return data for %s.", ticker)
+        logger.error("Alpaca fallback did not return sufficient data for %s.", ticker)
     except Exception as e:
         logger.exception("Unexpected exception during Alpaca fallback for %s: %s", ticker, e)
 
@@ -246,6 +277,9 @@ def get_latest_signal(df: pd.DataFrame) -> str:
 # --- Alpaca trading helpers ---
 def get_cash_balance() -> float:
     try:
+        if api is None:
+            logger.error("Alpaca API client not available for get_cash_balance.")
+            return 0.0
         acct = api.get_account()
         return float(acct.cash)
     except Exception:
@@ -254,6 +288,8 @@ def get_cash_balance() -> float:
 
 def get_position_qty(symbol: str) -> float:
     try:
+        if api is None:
+            return 0.0
         pos = api.get_position(symbol)
         return float(pos.qty)
     except Exception:
@@ -262,6 +298,9 @@ def get_position_qty(symbol: str) -> float:
 def place_market_order(symbol: str, qty: float, side: str):
     if qty <= 0:
         logger.info("Quantity <= 0, nothing to place.")
+        return None
+    if api is None:
+        logger.error("Alpaca API not configured; cannot place order.")
         return None
     try:
         order = api.submit_order(
@@ -292,6 +331,8 @@ def size_position_by_cash(symbol: str, usd_amount: float) -> int:
 
 def cancel_open_orders_for(symbol: str):
     try:
+        if api is None:
+            return
         open_orders = api.list_orders(status='open', symbols=[symbol])
         for o in open_orders:
             api.cancel_order(o.id)
