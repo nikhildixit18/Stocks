@@ -49,6 +49,34 @@ def sanitize_ticker(raw_ticker: str, default: str = "AAPL") -> str:
     logger.info("Using sanitized TICKER: %s", t)
     return t
 
+def sanitize_timeframe(raw_tf: str, default: str = "1d") -> str:
+    """
+    Ensure timeframe is a non-empty string that yfinance accepts (e.g. '1d', '1h', '5m').
+    Falls back to default on invalid input.
+    """
+    if raw_tf is None:
+        logger.warning("TIMEFRAME is not set; using default '%s'.", default)
+        return default
+    tf = raw_tf.strip()
+    # remove accidental quotes/newlines
+    if (tf.startswith('"') and tf.endswith('"')) or (tf.startswith("'") and tf.endswith("'")):
+        tf = tf[1:-1].strip()
+
+    tf = tf.replace("\n", "").replace("\r", "").replace("\t", "").strip()
+    if tf == "":
+        logger.warning("TIMEFRAME is empty after cleaning; using default '%s'.", default)
+        return default
+
+    # very permissive validation: must contain digit then a letter (e.g. '1d', '60m')
+    import re
+    if not re.fullmatch(r"\d+[mhdwM]", tf):
+        # still accept common values like '1d', '1h', '5m'
+        logger.warning("TIMEFRAME '%s' looks unusual; falling back to default '%s'.", tf, default)
+        return default
+
+    logger.info("Using sanitized TIMEFRAME: %s", tf)
+    return tf
+
 # --- Config from environment (set these as GitHub Secrets / Actions env) ---
 API_KEY = os.environ.get("ALPACA_API_KEY")
 API_SECRET = os.environ.get("ALPACA_SECRET_KEY")
@@ -57,7 +85,7 @@ TICKER = sanitize_ticker(os.environ.get("TICKER", "AAPL"))
 SHORT_WINDOW = int(os.environ.get("SHORT_WINDOW", "10"))
 LONG_WINDOW = int(os.environ.get("LONG_WINDOW", "60"))
 POSITION_SIZE_USD = float(os.environ.get("POSITION_SIZE_USD", "100"))  # $ per trade
-TIMEFRAME = os.environ.get("TIMEFRAME", "1d")  # used by yfinance: '1d', '1h', etc.
+TIMEFRAME = sanitize_timeframe(os.environ.get("TIMEFRAME", "1d"))
 DATA_LOOKBACK_DAYS = int(os.environ.get("DATA_LOOKBACK_DAYS", "90"))
 
 if not API_KEY or not API_SECRET:
