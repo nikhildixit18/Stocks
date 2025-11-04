@@ -95,49 +95,154 @@ if not API_KEY or not API_SECRET:
 # Alpaca connection
 api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version='v2')
 
+from datetime import datetime, timedelta
+
+# map yfinance-style intervals to a reasonable Alpaca timeframe string
+_ALPACA_INTERVAL_MAP = {
+    "1m": "1Min",
+    "5m": "5Min",
+    "15m": "15Min",
+    "30m": "30Min",
+    "60m": "1Hour",
+    "1h": "1Hour",
+    "1d": "1Day",
+    "1w": "1Week",
+}
+
+def _alpaca_bars_to_df(bars):
+    """
+    Convert Alpaca 'bars' (iterable of bar objects/dicts) into a pandas DataFrame
+    with columns: Open, High, Low, Close, Volume and index as timestamp (UTC).
+    Works with both v2 Bar objects and older bar dicts.
+    """
+    if bars is None:
+        return pd.DataFrame()
+    rows = []
+    for b in bars:
+        # support both object-like and dict-like bars
+        try:
+            t = getattr(b, "t", None) or b.get("t")  # time
+            o = getattr(b, "o", None) or b.get("o")
+            h = getattr(b, "h", None) or b.get("h")
+            l = getattr(b, "l", None) or b.get("l")
+            c = getattr(b, "c", None) or b.get("c")
+            v = getattr(b, "v", None) or b.get("v")
+        except Exception:
+            # last-resort attempt: attempt indexing
+            try:
+                t, o, h, l, c, v = b
+            except Exception:
+                continue
+        # normalize timestamp: alpaca may return ISO or datetime
+        if isinstance(t, str):
+            try:
+                t = pd.to_datetime(t)
+            except Exception:
+                pass
+        rows.append({"Datetime": pd.to_datetime(t), "Open": o, "High": h, "Low": l, "Close": c, "Volume": v})
+
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows).set_index("Datetime").sort_index()
+    # yfinance returns columns labelled like 'Open' 'Close' etc; keep consistent
+    return df
+
 def fetch_data(ticker: str, lookback_days: int, interval: str = "1d") -> pd.DataFrame:
     """
-    Robust data fetcher with interval defaulting to '1d' if invalid/empty,
-    and clearer logging for debugging.
+    Try yfinance, then fall back to Alpaca market data if yfinance returns empty.
+    Returns an empty DataFrame if both methods fail.
     """
     ticker = (ticker or "").strip()
     if ticker == "":
         logger.error("TICKER is empty in fetch_data().")
         return pd.DataFrame()
 
-    # ensure we have a sane interval
-    interval = (interval or "").strip()
-    if interval == "":
-        logger.warning("Interval empty; forcing default interval '1d'.")
-        interval = "1d"
-
-    # yfinance expects period such as '90d' for n days
+    # sanitize interval to a sensible default
+    interval = (interval or "").strip() or "1d"
     period = f"{max(30, lookback_days)}d"
-    logger.info("Calling yfinance.download(ticker=%r, period=%r, interval=%r)", ticker, period, interval)
+    logger.info("fetch_data: yfinance.download(ticker=%r, period=%r, interval=%r)", ticker, period, interval)
 
-    max_attempts = 4
+    # 1) Try yfinance first (same logic as before)
+    max_attempts = 3
     for attempt in range(1, max_attempts + 1):
         try:
             df = yf.download(ticker, period=period, interval=interval, progress=False)
             if df is None or df.empty:
-                logger.warning("yfinance returned empty or None for %s on attempt %d/%d.", ticker, attempt, max_attempts)
+                logger.warning("yfinance returned empty or None for %s (attempt %d/%d).", ticker, attempt, max_attempts)
                 if attempt < max_attempts:
                     time.sleep(2 ** attempt)
                     continue
-                logger.error("All %d attempts exhausted — no data available for %s.", max_attempts, ticker)
-                return pd.DataFrame()
-            df = df.dropna()
-            if df.empty:
-                logger.warning("Data exists but dropped to empty after dropna() for %s.", ticker)
-                return pd.DataFrame()
-            return df
+                logger.info("yfinance exhausted attempts, will try Alpaca fallback.")
+                df = pd.DataFrame()
+            else:
+                df = df.dropna()
+                if df.empty:
+                    logger.warning("Data exists but dropped to empty after dropna() for %s.", ticker)
+                    # proceed to Alpaca fallback
+                    df = pd.DataFrame()
+                else:
+                    logger.info("yfinance succeeded for %s (%d rows).", ticker, len(df))
+                    return df
         except Exception as e:
-            logger.exception("Exception while fetching data from yfinance (attempt %d/%d): %s", attempt, max_attempts, e)
+            logger.exception("yfinance exception for %s (attempt %d/%d): %s", ticker, attempt, max_attempts, e)
             if attempt < max_attempts:
                 time.sleep(2 ** attempt)
             else:
-                logger.error("All attempts failed due to exceptions. Returning empty DataFrame.")
-                return pd.DataFrame()
+                logger.info("yfinance final exception, will try Alpaca fallback.")
+
+    # 2) Alpaca fallback
+    try:
+        logger.info("Attempting Alpaca fallback for %s", ticker)
+        # choose Alpaca timeframe name
+        alp_tf = _ALPACA_INTERVAL_MAP.get(interval, None)
+        if alp_tf is None:
+            # try to coerce numeric-minute strings like '60m' -> '1Hour'
+            alp_tf = _ALPACA_INTERVAL_MAP.get(interval.lower(), "1Day")
+
+        # calc start/end for bars: Alpaca often supports start/end instead of limit
+        end = datetime.utcnow()
+        start = end - timedelta(days=max(lookback_days, 30))
+
+        # Try the modern get_bars (alpaca-trade-api v1.5+/v2 wrapper)
+        try:
+            # new: api.get_bars(symbol_or_symbols, timeframe, start=start, end=end)
+            bars = api.get_bars(ticker, alp_tf, start=start.isoformat(), end=end.isoformat())
+            df_bars = _alpaca_bars_to_df(bars)
+            if not df_bars.empty:
+                logger.info("Alpaca get_bars succeeded for %s (%d bars).", ticker, len(df_bars))
+                return df_bars
+            logger.warning("Alpaca get_bars returned empty for %s.", ticker)
+        except TypeError:
+            # signature mismatch; try alternate call style
+            try:
+                bars = api.get_bars(ticker, timeframe=alp_tf, start=start, end=end)
+                df_bars = _alpaca_bars_to_df(bars)
+                if not df_bars.empty:
+                    logger.info("Alpaca get_bars (alt signature) succeeded for %s.", ticker)
+                    return df_bars
+            except Exception as e:
+                logger.debug("Alpaca get_bars alt signature failed: %s", e)
+
+        # If get_bars not available, try older get_barset (deprecated but may exist)
+        try:
+            barset = api.get_barset(ticker, interval, limit=lookback_days)
+            # barset[ticker] is a list of bar objects
+            bars = barset.get(ticker) if isinstance(barset, dict) else getattr(barset, ticker, barset)
+            df_bars = _alpaca_bars_to_df(bars)
+            if not df_bars.empty:
+                logger.info("Alpaca get_barset succeeded for %s (%d bars).", ticker, len(df_bars))
+                return df_bars
+            logger.warning("Alpaca get_barset returned empty for %s.", ticker)
+        except Exception as e:
+            logger.debug("Alpaca get_barset failed: %s", e)
+
+        logger.error("Alpaca fallback did not return data for %s.", ticker)
+    except Exception as e:
+        logger.exception("Unexpected exception during Alpaca fallback for %s: %s", ticker, e)
+
+    # final: nothing worked
+    logger.error("No market data available from yfinance or Alpaca for %s.", ticker)
+    return pd.DataFrame()
 
 def calculate_signals(df: pd.DataFrame, short_w: int, long_w: int) -> pd.DataFrame:
     df = df.copy()
