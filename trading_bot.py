@@ -74,6 +74,7 @@ def fetch_data(ticker: str, lookback_days: int, interval: str = "1d") -> pd.Data
             else:
                 logger.error("All attempts failed due to exceptions. Returning empty DataFrame.")
                 return pd.DataFrame()
+
 def calculate_signals(df: pd.DataFrame, short_w: int, long_w: int) -> pd.DataFrame:
     df = df.copy()
     df["short_ma"] = df["Close"].rolling(window=short_w).mean()
