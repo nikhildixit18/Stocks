@@ -1,13 +1,13 @@
 # trading_bot.py
 import os
 import time
-import re
 import logging
 from datetime import datetime, timezone
 import yfinance as yf
 import pandas as pd
 import numpy as np
 import alpaca_trade_api as tradeapi
+import re
 
 # --- Logging setup ---
 logging.basicConfig(
