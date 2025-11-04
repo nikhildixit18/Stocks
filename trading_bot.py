@@ -7,6 +7,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import alpaca_trade_api as tradeapi
+import re
 
 # --- Logging setup ---
 logging.basicConfig(
@@ -15,11 +16,44 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+def sanitize_ticker(raw_ticker: str, default: str = "AAPL") -> str:
+    """
+    Clean and validate the raw ticker string from env / secrets.
+    Returns a valid ticker (or default) and logs details for debugging.
+    """
+    if raw_ticker is None:
+        logger.error("TICKER is None (not set). Falling back to default: %s", default)
+        return default
+
+    # show repr for debugging hidden characters (will appear in Action logs)
+    logger.info("Raw TICKER repr: %r (len=%d)", raw_ticker, len(raw_ticker))
+
+    # Strip whitespace and surrounding quotes (single or double)
+    t = raw_ticker.strip()
+    if (t.startswith('"') and t.endswith('"')) or (t.startswith("'") and t.endswith("'")):
+        t = t[1:-1].strip()
+        logger.info("Removed surrounding quotes from TICKER. New repr: %r (len=%d)", t, len(t))
+
+    # remove any stray control chars
+    t = re.sub(r'[\r\n\t]+', '', t).strip()
+
+    # Basic validation: allowed characters A-Z, a-z, 0-9, dot, dash
+    if not re.fullmatch(r"[A-Za-z0-9\.\-]+", t):
+        logger.error("TICKER contains invalid characters after cleaning: %r. Falling back to default: %s", t, default)
+        return default
+
+    if len(t) == 0:
+        logger.error("TICKER is empty after cleaning. Falling back to default: %s", default)
+        return default
+
+    logger.info("Using sanitized TICKER: %s", t)
+    return t
+
 # --- Config from environment (set these as GitHub Secrets / Actions env) ---
 API_KEY = os.environ.get("ALPACA_API_KEY")
 API_SECRET = os.environ.get("ALPACA_SECRET_KEY")
 BASE_URL = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
-TICKER = os.environ.get("TICKER", "AAPL")
+TICKER = sanitize_ticker(os.environ.get("TICKER", "AAPL"))
 SHORT_WINDOW = int(os.environ.get("SHORT_WINDOW", "10"))
 LONG_WINDOW = int(os.environ.get("LONG_WINDOW", "60"))
 POSITION_SIZE_USD = float(os.environ.get("POSITION_SIZE_USD", "100"))  # $ per trade
@@ -34,10 +68,46 @@ if not API_KEY or not API_SECRET:
 api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version='v2')
 
 def fetch_data(ticker: str, lookback_days: int, interval: str = "1d") -> pd.DataFrame:
+    """
+    Robust data fetcher using yfinance with retries and input validation.
+    Returns an empty DataFrame on repeated failures (caller must handle).
+    """
+    ticker = (ticker or "").strip()
+    if ticker == "":
+        logger.error("TICKER environment variable is empty. Set TICKER (e.g., 'AAPL').")
+        return pd.DataFrame()
+
     period = f"{max(30, lookback_days)}d"
-    df = yf.download(ticker, period=period, interval=interval, progress=False)
-    df = df.dropna()
-    return df
+    max_attempts = 4
+    for attempt in range(1, max_attempts + 1):
+        try:
+            logger.info(f"Fetching historical data for {ticker} (period={period}, interval={interval}) attempt {attempt}/{max_attempts}")
+            df = yf.download(ticker, period=period, interval=interval, progress=False)
+            if df is None:
+                logger.warning("yfinance returned None (treating as empty).")
+                df = pd.DataFrame()
+            if df.empty:
+                logger.warning(f"yfinance returned empty DataFrame for {ticker} on attempt {attempt}.")
+                # transient wait then retry
+                if attempt < max_attempts:
+                    time.sleep(2 ** attempt)  # 2, 4, 8 seconds
+                    continue
+                else:
+                    logger.error(f"All {max_attempts} attempts exhausted — no data available for {ticker}.")
+                    return pd.DataFrame()
+            # successful non-empty df
+            df = df.dropna()
+            if df.empty:
+                logger.warning("Data exists but dropped to empty after dropna().")
+                return pd.DataFrame()
+            return df
+        except Exception as e:
+            logger.exception(f"Exception while fetching data from yfinance (attempt {attempt}): {e}")
+            if attempt < max_attempts:
+                time.sleep(2 ** attempt)
+            else:
+                logger.error("All attempts failed due to exceptions. Returning empty DataFrame.")
+                return pd.DataFrame()
 
 def calculate_signals(df: pd.DataFrame, short_w: int, long_w: int) -> pd.DataFrame:
     df = df.copy()
