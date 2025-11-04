@@ -97,40 +97,42 @@ api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version='v2')
 
 def fetch_data(ticker: str, lookback_days: int, interval: str = "1d") -> pd.DataFrame:
     """
-    Robust data fetcher using yfinance with retries and input validation.
-    Returns an empty DataFrame on repeated failures (caller must handle).
+    Robust data fetcher with interval defaulting to '1d' if invalid/empty,
+    and clearer logging for debugging.
     """
     ticker = (ticker or "").strip()
     if ticker == "":
-        logger.error("TICKER environment variable is empty. Set TICKER (e.g., 'AAPL').")
+        logger.error("TICKER is empty in fetch_data().")
         return pd.DataFrame()
 
+    # ensure we have a sane interval
+    interval = (interval or "").strip()
+    if interval == "":
+        logger.warning("Interval empty; forcing default interval '1d'.")
+        interval = "1d"
+
+    # yfinance expects period such as '90d' for n days
     period = f"{max(30, lookback_days)}d"
+    logger.info("Calling yfinance.download(ticker=%r, period=%r, interval=%r)", ticker, period, interval)
+
     max_attempts = 4
     for attempt in range(1, max_attempts + 1):
         try:
-            logger.info(f"Fetching historical data for {ticker} (period={period}, interval={interval}) attempt {attempt}/{max_attempts}")
             df = yf.download(ticker, period=period, interval=interval, progress=False)
-            if df is None:
-                logger.warning("yfinance returned None (treating as empty).")
-                df = pd.DataFrame()
-            if df.empty:
-                logger.warning(f"yfinance returned empty DataFrame for {ticker} on attempt {attempt}.")
-                # transient wait then retry
+            if df is None or df.empty:
+                logger.warning("yfinance returned empty or None for %s on attempt %d/%d.", ticker, attempt, max_attempts)
                 if attempt < max_attempts:
-                    time.sleep(2 ** attempt)  # 2, 4, 8 seconds
+                    time.sleep(2 ** attempt)
                     continue
-                else:
-                    logger.error(f"All {max_attempts} attempts exhausted — no data available for {ticker}.")
-                    return pd.DataFrame()
-            # successful non-empty df
+                logger.error("All %d attempts exhausted — no data available for %s.", max_attempts, ticker)
+                return pd.DataFrame()
             df = df.dropna()
             if df.empty:
-                logger.warning("Data exists but dropped to empty after dropna().")
+                logger.warning("Data exists but dropped to empty after dropna() for %s.", ticker)
                 return pd.DataFrame()
             return df
         except Exception as e:
-            logger.exception(f"Exception while fetching data from yfinance (attempt {attempt}): {e}")
+            logger.exception("Exception while fetching data from yfinance (attempt %d/%d): %s", attempt, max_attempts, e)
             if attempt < max_attempts:
                 time.sleep(2 ** attempt)
             else:
