@@ -16,24 +16,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- Config from environment (set these as GitHub Secrets / Actions env) ---
-API_KEY = os.environ.get("ALPACA_API_KEY")
-API_SECRET = os.environ.get("ALPACA_SECRET_KEY")
-BASE_URL = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
-TICKER = os.environ.get("TICKER", "AAPL")
-SHORT_WINDOW = int(os.environ.get("SHORT_WINDOW", "10"))
-LONG_WINDOW = int(os.environ.get("LONG_WINDOW", "60"))
-POSITION_SIZE_USD = float(os.environ.get("POSITION_SIZE_USD", "100"))  # $ per trade
-TIMEFRAME = os.environ.get("TIMEFRAME", "1d")  # used by yfinance: '1d', '1h', etc.
-DATA_LOOKBACK_DAYS = int(os.environ.get("DATA_LOOKBACK_DAYS", "90"))
-
-if not API_KEY or not API_SECRET:
-    logger.error("ALPACA_API_KEY and ALPACA_SECRET_KEY must be set as environment variables.")
-    raise SystemExit("Missing Alpaca API credentials")
-
-# Alpaca connection
-api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version='v2')
-
 def sanitize_ticker(raw_ticker: str, default: str = "AAPL") -> str:
     """
     Clean and validate the raw ticker string from env / secrets.
@@ -67,7 +49,23 @@ def sanitize_ticker(raw_ticker: str, default: str = "AAPL") -> str:
     logger.info("Using sanitized TICKER: %s", t)
     return t
 
+# --- Config from environment (set these as GitHub Secrets / Actions env) ---
+API_KEY = os.environ.get("ALPACA_API_KEY")
+API_SECRET = os.environ.get("ALPACA_SECRET_KEY")
+BASE_URL = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 TICKER = sanitize_ticker(os.environ.get("TICKER", "AAPL"))
+SHORT_WINDOW = int(os.environ.get("SHORT_WINDOW", "10"))
+LONG_WINDOW = int(os.environ.get("LONG_WINDOW", "60"))
+POSITION_SIZE_USD = float(os.environ.get("POSITION_SIZE_USD", "100"))  # $ per trade
+TIMEFRAME = os.environ.get("TIMEFRAME", "1d")  # used by yfinance: '1d', '1h', etc.
+DATA_LOOKBACK_DAYS = int(os.environ.get("DATA_LOOKBACK_DAYS", "90"))
+
+if not API_KEY or not API_SECRET:
+    logger.error("ALPACA_API_KEY and ALPACA_SECRET_KEY must be set as environment variables.")
+    raise SystemExit("Missing Alpaca API credentials")
+
+# Alpaca connection
+api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version='v2')
 
 def fetch_data(ticker: str, lookback_days: int, interval: str = "1d") -> pd.DataFrame:
     """
