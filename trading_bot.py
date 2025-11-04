@@ -1,6 +1,7 @@
 # trading_bot.py
 import os
 import time
+import re
 import logging
 from datetime import datetime, timezone
 import yfinance as yf
@@ -32,6 +33,41 @@ if not API_KEY or not API_SECRET:
 
 # Alpaca connection
 api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version='v2')
+
+def sanitize_ticker(raw_ticker: str, default: str = "AAPL") -> str:
+    """
+    Clean and validate the raw ticker string from env / secrets.
+    Returns a valid ticker (or default) and logs details for debugging.
+    """
+    if raw_ticker is None:
+        logger.error("TICKER is None (not set). Falling back to default: %s", default)
+        return default
+
+    # show repr for debugging hidden characters (will appear in Action logs)
+    logger.info("Raw TICKER repr: %r (len=%d)", raw_ticker, len(raw_ticker))
+
+    # Strip whitespace and surrounding quotes (single or double)
+    t = raw_ticker.strip()
+    if (t.startswith('"') and t.endswith('"')) or (t.startswith("'") and t.endswith("'")):
+        t = t[1:-1].strip()
+        logger.info("Removed surrounding quotes from TICKER. New repr: %r (len=%d)", t, len(t))
+
+    # remove any stray control chars
+    t = re.sub(r'[\r\n\t]+', '', t).strip()
+
+    # Basic validation: allowed characters A-Z, a-z, 0-9, dot, dash
+    if not re.fullmatch(r"[A-Za-z0-9\.\-]+", t):
+        logger.error("TICKER contains invalid characters after cleaning: %r. Falling back to default: %s", t, default)
+        return default
+
+    if len(t) == 0:
+        logger.error("TICKER is empty after cleaning. Falling back to default: %s", default)
+        return default
+
+    logger.info("Using sanitized TICKER: %s", t)
+    return t
+
+TICKER = sanitize_ticker(os.environ.get("TICKER", "AAPL"))
 
 def fetch_data(ticker: str, lookback_days: int, interval: str = "1d") -> pd.DataFrame:
     """
