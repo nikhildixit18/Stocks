@@ -190,47 +190,55 @@ def fetch_data(ticker: str, lookback_days: int, interval: str = "1d") -> pd.Data
             else:
                 logger.info("yfinance final exception, will try Alpaca fallback.")
 
-    # 2) Alpaca fallback
+    # 2) Alpaca fallback (simpler, use `limit` to avoid start/end date format issues)
     try:
-        logger.info("Attempting Alpaca fallback for %s", ticker)
-        # choose Alpaca timeframe name
+        logger.info("Attempting Alpaca fallback for %s (limit-based call)", ticker)
         alp_tf = _ALPACA_INTERVAL_MAP.get(interval, None)
         if alp_tf is None:
-            # try to coerce numeric-minute strings like '60m' -> '1Hour'
             alp_tf = _ALPACA_INTERVAL_MAP.get(interval.lower(), "1Day")
 
-        # calc start/end for bars: Alpaca often supports start/end instead of limit
-        end = datetime.utcnow()
-        start = end - timedelta(days=max(lookback_days, 30))
+        # Use 'limit' instead of start/end to avoid RFC3339 parsing problems
+        # Choose a sensible bar count: lookback_days (daily) or convert days->bars for intraday
+        if interval.endswith("d") or interval.lower() in ("1d", "1w"):
+            limit = max(lookback_days, 30)
+        else:
+            # for intraday, choose more bars to cover lookback_days worth of trading minutes
+            # e.g. for '1m' take 390 minutes per day * lookback_days (cap it reasonably)
+            if interval.endswith("m"):
+                minutes_per_day = 390
+                try:
+                    mult = int(interval[:-1])
+                except Exception:
+                    mult = 1
+                approximate_bars = (minutes_per_day // max(1, mult)) * lookback_days
+                limit = min(max(approximate_bars, 100), 5000)  # avoid huge limits
+            elif interval.endswith("h") or interval.lower() == "1h":
+                bars_per_day = 7  # rough trading hours
+                limit = min(max(bars_per_day * lookback_days, 30), 2000)
+            else:
+                limit = max(lookback_days, 30)
 
-        # Try the modern get_bars (alpaca-trade-api v1.5+/v2 wrapper)
+        logger.info("Alpaca fallback: get_bars(symbol=%r, timeframe=%r, limit=%d)", ticker, alp_tf, limit)
+
+        # Try modern get_bars signature: (symbol, timeframe, limit=...)
         try:
-            # new: api.get_bars(symbol_or_symbols, timeframe, start=start, end=end)
-            bars = api.get_bars(ticker, alp_tf, start=start.isoformat(), end=end.isoformat())
+            bars = api.get_bars(ticker, alp_tf, limit=limit)
             df_bars = _alpaca_bars_to_df(bars)
             if not df_bars.empty:
-                logger.info("Alpaca get_bars succeeded for %s (%d bars).", ticker, len(df_bars))
+                logger.info("Alpaca get_bars succeeded for %s (%d rows).", ticker, len(df_bars))
                 return df_bars
             logger.warning("Alpaca get_bars returned empty for %s.", ticker)
-        except TypeError:
-            # signature mismatch; try alternate call style
-            try:
-                bars = api.get_bars(ticker, timeframe=alp_tf, start=start, end=end)
-                df_bars = _alpaca_bars_to_df(bars)
-                if not df_bars.empty:
-                    logger.info("Alpaca get_bars (alt signature) succeeded for %s.", ticker)
-                    return df_bars
-            except Exception as e:
-                logger.debug("Alpaca get_bars alt signature failed: %s", e)
+        except Exception as e:
+            logger.debug("Alpaca get_bars exception: %s", e)
 
-        # If get_bars not available, try older get_barset (deprecated but may exist)
+        # Fallback: try get_barset (older API)
         try:
-            barset = api.get_barset(ticker, interval, limit=lookback_days)
+            barset = api.get_barset(ticker, interval, limit=limit)
             # barset[ticker] is a list of bar objects
             bars = barset.get(ticker) if isinstance(barset, dict) else getattr(barset, ticker, barset)
             df_bars = _alpaca_bars_to_df(bars)
             if not df_bars.empty:
-                logger.info("Alpaca get_barset succeeded for %s (%d bars).", ticker, len(df_bars))
+                logger.info("Alpaca get_barset succeeded for %s (%d rows).", ticker, len(df_bars))
                 return df_bars
             logger.warning("Alpaca get_barset returned empty for %s.", ticker)
         except Exception as e:
@@ -239,8 +247,7 @@ def fetch_data(ticker: str, lookback_days: int, interval: str = "1d") -> pd.Data
         logger.error("Alpaca fallback did not return data for %s.", ticker)
     except Exception as e:
         logger.exception("Unexpected exception during Alpaca fallback for %s: %s", ticker, e)
-
-    # final: nothing worked
+        
     logger.error("No market data available from yfinance or Alpaca for %s.", ticker)
     return pd.DataFrame()
 
