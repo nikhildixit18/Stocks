@@ -34,11 +34,46 @@ if not API_KEY or not API_SECRET:
 api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version='v2')
 
 def fetch_data(ticker: str, lookback_days: int, interval: str = "1d") -> pd.DataFrame:
-    period = f"{max(30, lookback_days)}d"
-    df = yf.download(ticker, period=period, interval=interval, progress=False)
-    df = df.dropna()
-    return df
+    """
+    Robust data fetcher using yfinance with retries and input validation.
+    Returns an empty DataFrame on repeated failures (caller must handle).
+    """
+    ticker = (ticker or "").strip()
+    if ticker == "":
+        logger.error("TICKER environment variable is empty. Set TICKER (e.g., 'AAPL').")
+        return pd.DataFrame()
 
+    period = f"{max(30, lookback_days)}d"
+    max_attempts = 4
+    for attempt in range(1, max_attempts + 1):
+        try:
+            logger.info(f"Fetching historical data for {ticker} (period={period}, interval={interval}) attempt {attempt}/{max_attempts}")
+            df = yf.download(ticker, period=period, interval=interval, progress=False)
+            if df is None:
+                logger.warning("yfinance returned None (treating as empty).")
+                df = pd.DataFrame()
+            if df.empty:
+                logger.warning(f"yfinance returned empty DataFrame for {ticker} on attempt {attempt}.")
+                # transient wait then retry
+                if attempt < max_attempts:
+                    time.sleep(2 ** attempt)  # 2, 4, 8 seconds
+                    continue
+                else:
+                    logger.error(f"All {max_attempts} attempts exhausted — no data available for {ticker}.")
+                    return pd.DataFrame()
+            # successful non-empty df
+            df = df.dropna()
+            if df.empty:
+                logger.warning("Data exists but dropped to empty after dropna().")
+                return pd.DataFrame()
+            return df
+        except Exception as e:
+            logger.exception(f"Exception while fetching data from yfinance (attempt {attempt}): {e}")
+            if attempt < max_attempts:
+                time.sleep(2 ** attempt)
+            else:
+                logger.error("All attempts failed due to exceptions. Returning empty DataFrame.")
+                return pd.DataFrame()
 def calculate_signals(df: pd.DataFrame, short_w: int, long_w: int) -> pd.DataFrame:
     df = df.copy()
     df["short_ma"] = df["Close"].rolling(window=short_w).mean()
